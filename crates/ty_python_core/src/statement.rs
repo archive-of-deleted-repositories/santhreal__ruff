@@ -1,10 +1,10 @@
 use crate::ast_node_ref::AstNodeRef;
 use crate::db::Db;
 use crate::definition::Definition;
+use crate::environment::AnalysisFile;
 use crate::expression::Expression;
 use crate::node_key::NodeKey;
 use crate::scope::{FileScopeId, ScopeId};
-use ruff_db::files::File;
 use ruff_python_ast as ast;
 use salsa;
 
@@ -13,7 +13,7 @@ use salsa;
 /// Many statements can be treated directly as definitions or expressions,
 /// and so do not require a separate Salsa allocation.
 #[derive(
-    Clone, Copy, Debug, Eq, Hash, PartialEq, salsa::Supertype, get_size2::GetSize, salsa::SalsaValue,
+    Clone, Copy, Debug, Eq, Hash, PartialEq, salsa::Supertype, salsa::SalsaValue, get_size2::GetSize,
 )]
 pub enum Statement<'db> {
     Expression(Expression<'db>),
@@ -38,7 +38,7 @@ pub enum Statement<'db> {
 pub struct StatementInner<'db> {
     /// The file in which the statement occurs.
     #[returns(copy)]
-    pub file: File,
+    pub analysis_file: AnalysisFile<'db>,
 
     /// The scope in which the statement occurs.
     #[returns(copy)]
@@ -55,12 +55,16 @@ pub struct StatementInner<'db> {
 impl get_size2::GetSize for StatementInner<'_> {}
 
 impl<'db> StatementInner<'db> {
+    pub fn file(self, db: &'db dyn Db) -> ruff_db::files::File {
+        self.analysis_file(db).file(db)
+    }
+
     pub fn scope(self, db: &'db dyn Db) -> ScopeId<'db> {
-        self.file_scope(db).to_scope_id(db, self.file(db))
+        self.file_scope(db).to_scope_id(db, self.analysis_file(db))
     }
 }
 
-#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug, get_size2::GetSize, salsa::SalsaValue)]
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug, salsa::SalsaValue, get_size2::GetSize)]
 pub struct StatementNodeKey(NodeKey);
 
 impl From<&ast::Stmt> for StatementNodeKey {

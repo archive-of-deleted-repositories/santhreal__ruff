@@ -11,11 +11,9 @@ use ty_module_resolver::KnownModule;
 
 use super::call::CallArguments;
 use super::callable::CallableTypeKind;
-use super::{
-    IntersectionType, KnownClass, KnownInstanceType, MemberLookupPolicy, Type, TypeQualifiers,
-};
-use crate::Db;
+use super::{IntersectionType, KnownClass, MemberLookupPolicy, Type, TypeQualifiers};
 use crate::place::{DefinedPlace, Definedness, Place, PlaceAndQualifiers, builtins_symbol};
+use crate::{Db, Program};
 
 /// The operation required to write an attribute.
 ///
@@ -86,9 +84,8 @@ pub(super) enum InstanceAttributeWriteMember<'db> {
 
 /// The member that governs a write through a class object.
 ///
-/// A data descriptor on the metaclass takes precedence over the class object's own attributes,
-/// which in turn take precedence over definitely non-data metaclass members. If the metaclass
-/// member is absent or possibly undefined, the class object's own attributes form the fallback.
+/// The primary lookup is on the metaclass. If that lookup is absent or possibly undefined, the
+/// class object's own attributes form the fallback.
 pub(super) enum ClassAttributeWriteMember<'db> {
     /// A metaclass member governs the write, optionally alongside a class-attribute fallback.
     Explicit {
@@ -144,61 +141,6 @@ pub(super) enum FallbackAttributeWriteRequirement<'db> {
     PossiblyMissing,
 }
 
-/// The members that can govern an attribute write.
-///
-/// For a class-object receiver, the type member is found on the metaclass while the receiver member
-/// is found on the class's own MRO:
-///
-/// ```python
-/// class Descriptor:
-///     def __set__(self, instance: object, value: object) -> None: ...
-///
-/// class Meta(type):
-///     data = Descriptor()  # Type member: Meta.data
-///     plain = object()  # Type member: Meta.plain
-///
-/// class C(metaclass=Meta):
-///     data: int  # Receiver member: C.data
-///     plain: int  # Receiver member: C.plain
-///
-/// C.data = 1
-/// C.plain = 1
-/// ```
-pub(super) enum AssignmentAttributeMembers<'db> {
-    /// The type member governs the write, as `Meta.data` does above because it is a data descriptor.
-    /// If the type member may be missing, the corresponding receiver member (`C.data`) is retained
-    /// as `receiver_fallback`.
-    TypeMember {
-        member: PlaceAndQualifiers<'db>,
-        receiver_fallback: Option<PlaceAndQualifiers<'db>>,
-    },
-    /// The receiver member governs the write, as `C.plain` does above because `Meta.plain` is
-    /// definitely not a data descriptor.
-    ReceiverMember(PlaceAndQualifiers<'db>),
-}
-
-impl<'db> AssignmentAttributeMembers<'db> {
-    /// Return the member whose descriptor protocol applies to the receiver, if any.
-    pub(super) fn type_member(self) -> Option<PlaceAndQualifiers<'db>> {
-        match self {
-            Self::TypeMember { member, .. } => Some(member),
-            Self::ReceiverMember(_) => None,
-        }
-    }
-
-    /// Iterate over every member that can govern the write at runtime.
-    pub(super) fn effective_members(self) -> impl Iterator<Item = PlaceAndQualifiers<'db>> {
-        let members = match self {
-            Self::TypeMember {
-                member,
-                receiver_fallback,
-            } => [Some(member), receiver_fallback],
-            Self::ReceiverMember(member) => [Some(member), None],
-        };
-        members.into_iter().flatten()
-    }
-}
-
 /// Resolve the receiver-level requirements for writing `object_ty.attribute`.
 ///
 /// This expands aliases, preserves the all-arms rule for unions and the any-positive-arm rule for
@@ -206,6 +148,7 @@ impl<'db> AssignmentAttributeMembers<'db> {
 /// paths. It does not compare the assigned value with the resulting types.
 pub(super) fn attribute_write_requirement<'db>(
     db: &'db dyn Db,
+    program: Program,
     object_ty: Type<'db>,
     attribute: &str,
 ) -> AttributeWriteRequirement<'db> {
@@ -223,11 +166,16 @@ pub(super) fn attribute_write_requirement<'db>(
             }
         }
 
-        Type::EnumComplement(complement) => {
-            attribute_write_requirement(db, complement.remaining_literal_union(db), attribute)
-        }
+        Type::EnumComplement(complement) => attribute_write_requirement(
+            db,
+            program,
+            complement.remaining_literal_union(db),
+            attribute,
+        ),
 
-        Type::TypeAlias(alias) => attribute_write_requirement(db, alias.value_type(db), attribute),
+        Type::TypeAlias(alias) => {
+            attribute_write_requirement(db, program, alias.value_type(db), attribute)
+        }
 
         Type::NominalInstance(instance) if instance.has_known_class(db, KnownClass::Super) => {
             AttributeWriteRequirement::CannotAssign
@@ -240,9 +188,9 @@ pub(super) fn attribute_write_requirement<'db>(
 
         Type::ProtocolInstance(protocol) => protocol
             .interface(db)
-            .instance_write_requirement(db, object_ty, attribute)
+            .instance_write_requirement(db, program, object_ty, attribute)
             .map_or_else(
-                || instance_attribute_write_requirement(db, object_ty, attribute),
+                || instance_attribute_write_requirement(db, program, object_ty, attribute),
                 |(write_ty, qualifiers)| AttributeWriteRequirement::ProtocolMember {
                     write_ty,
                     qualifiers,
@@ -269,11 +217,11 @@ pub(super) fn attribute_write_requirement<'db>(
         | Type::TypeForm(_)
         | Type::TypedDict(_)
         | Type::NewTypeInstance(_) => {
-            instance_attribute_write_requirement(db, object_ty, attribute)
+            instance_attribute_write_requirement(db, program, object_ty, attribute)
         }
 
         Type::ClassLiteral(..) | Type::GenericAlias(..) | Type::SubclassOf(..) => {
-            class_attribute_write_requirement(db, object_ty, attribute)
+            class_attribute_write_requirement(db, program, object_ty, attribute)
         }
 
         Type::ModuleLiteral(module) => {
@@ -282,7 +230,7 @@ pub(super) fn attribute_write_requirement<'db>(
                 .known(db)
                 .is_some_and(KnownModule::is_builtins)
             {
-                builtins_symbol(db, attribute)
+                builtins_symbol(db, module.program(db), attribute)
             } else {
                 module.static_member(db, attribute)
             };
@@ -296,12 +244,13 @@ pub(super) fn attribute_write_requirement<'db>(
 
 fn instance_attribute_write_requirement<'db>(
     db: &'db dyn Db,
+    program: Program,
     object_ty: Type<'db>,
     attribute: &str,
 ) -> AttributeWriteRequirement<'db> {
     AttributeWriteRequirement::Instance {
         object_ty,
-        member: instance_attribute_write_member_requirement(db, object_ty, attribute),
+        member: instance_attribute_write_member_requirement(db, program, object_ty, attribute),
     }
 }
 
@@ -312,52 +261,45 @@ fn instance_attribute_write_requirement<'db>(
 /// `__setattr__`.
 fn instance_attribute_write_member_requirement<'db>(
     db: &'db dyn Db,
+    program: Program,
     object_ty: Type<'db>,
     attribute: &str,
 ) -> InstanceAttributeWriteMember<'db> {
-    let Some(members) = assignment_attribute_members(db, object_ty, attribute) else {
+    let Some((meta_attr, fallback_attr)) =
+        assignment_attribute_members(db, program, object_ty, attribute)
+    else {
         return InstanceAttributeWriteMember::SetAttr;
     };
-    let (type_member, receiver_fallback) = match members {
-        AssignmentAttributeMembers::TypeMember {
-            member,
-            receiver_fallback,
-        } => (member, receiver_fallback),
-        AssignmentAttributeMembers::ReceiverMember(member) => {
-            return InstanceAttributeWriteMember::Instance(instance_fallback_write_requirement(
-                db, object_ty, attribute, member,
-            ));
-        }
-    };
 
-    match type_member {
-        type_member if type_member.is_class_var() => InstanceAttributeWriteMember::ClassVar,
+    match meta_attr {
+        meta_attr if meta_attr.is_class_var() => InstanceAttributeWriteMember::ClassVar,
         PlaceAndQualifiers {
             place: Place::Defined(DefinedPlace { ty, .. }),
             qualifiers,
         } => InstanceAttributeWriteMember::Explicit {
             member: explicit_attribute_write_requirement(
                 db,
+                program,
                 object_ty,
                 attribute,
-                ty.bind_self_typevars(db, object_ty),
+                ty.bind_self_typevars(db, program, object_ty),
                 qualifiers,
             ),
-            fallback: receiver_fallback.map(|fallback| {
-                instance_fallback_write_requirement(db, object_ty, attribute, fallback)
+            fallback: fallback_attr.map(|fallback| {
+                instance_fallback_write_requirement(db, program, object_ty, attribute, fallback)
             }),
         },
         PlaceAndQualifiers {
             place: Place::Undefined,
             ..
-        } => match receiver_fallback {
+        } => match fallback_attr {
             Some(
                 fallback @ PlaceAndQualifiers {
                     place: Place::Defined(_),
                     ..
                 },
             ) => InstanceAttributeWriteMember::Instance(instance_fallback_write_requirement(
-                db, object_ty, attribute, fallback,
+                db, program, object_ty, attribute, fallback,
             )),
             _ => InstanceAttributeWriteMember::SetAttr,
         },
@@ -370,44 +312,41 @@ fn instance_attribute_write_member_requirement<'db>(
 /// declarations can be bound consistently with normal class-object member lookup.
 fn class_attribute_write_requirement<'db>(
     db: &'db dyn Db,
+    program: Program,
     object_ty: Type<'db>,
     attribute: &str,
 ) -> AttributeWriteRequirement<'db> {
-    let Some(members) = assignment_attribute_members(db, object_ty, attribute) else {
+    let Some((meta_attr, fallback_attr)) =
+        assignment_attribute_members(db, program, object_ty, attribute)
+    else {
         return AttributeWriteRequirement::Unconstrained;
     };
-    let Some(class_attr_self_ty) = object_ty.to_instance(db) else {
+    let Some(class_attr_self_ty) = object_ty.to_instance(db, program) else {
         return AttributeWriteRequirement::Unconstrained;
-    };
-    let (type_member, receiver_fallback) = match members {
-        AssignmentAttributeMembers::TypeMember {
-            member,
-            receiver_fallback,
-        } => (member, receiver_fallback),
-        AssignmentAttributeMembers::ReceiverMember(member) => {
-            return AttributeWriteRequirement::Class {
-                object_ty,
-                member: ClassAttributeWriteMember::ClassAttribute(
-                    class_fallback_write_requirement(db, object_ty, class_attr_self_ty, member),
-                ),
-            };
-        }
     };
 
-    let member = match type_member {
+    let member = match meta_attr {
         PlaceAndQualifiers {
             place: Place::Defined(DefinedPlace { ty, .. }),
             qualifiers,
         } => ClassAttributeWriteMember::Explicit {
-            member: explicit_attribute_write_requirement(db, object_ty, attribute, ty, qualifiers),
-            fallback: receiver_fallback.map(|fallback| {
-                class_fallback_write_requirement(db, object_ty, class_attr_self_ty, fallback)
+            member: explicit_attribute_write_requirement(
+                db, program, object_ty, attribute, ty, qualifiers,
+            ),
+            fallback: fallback_attr.map(|fallback| {
+                class_fallback_write_requirement(
+                    db,
+                    program,
+                    object_ty,
+                    class_attr_self_ty,
+                    fallback,
+                )
             }),
         },
         PlaceAndQualifiers {
             place: Place::Undefined,
             ..
-        } => match receiver_fallback {
+        } => match fallback_attr {
             Some(
                 fallback @ PlaceAndQualifiers {
                     place: Place::Defined(_),
@@ -415,13 +354,14 @@ fn class_attribute_write_requirement<'db>(
                 },
             ) => ClassAttributeWriteMember::ClassAttribute(class_fallback_write_requirement(
                 db,
+                program,
                 object_ty,
                 class_attr_self_ty,
                 fallback,
             )),
             _ => ClassAttributeWriteMember::Unresolved {
                 has_instance_attribute: !class_attr_self_ty
-                    .instance_member(db, attribute)
+                    .instance_member(db, program, attribute)
                     .place
                     .is_undefined(),
             },
@@ -438,13 +378,19 @@ fn class_attribute_write_requirement<'db>(
 /// ordinary attribute to be treated as a data descriptor.
 fn explicit_attribute_write_requirement<'db>(
     db: &'db dyn Db,
+    program: Program,
     object_ty: Type<'db>,
     attribute: &str,
     attr_ty: Type<'db>,
     qualifiers: TypeQualifiers,
 ) -> ExplicitAttributeWriteRequirement<'db> {
     if let Place::Defined(DefinedPlace { ty: setter_ty, .. }) = attr_ty
-        .class_member_with_policy(db, "__set__".into(), MemberLookupPolicy::REQUIRE_CONCRETE)
+        .class_member_with_policy(
+            db,
+            program,
+            "__set__".into(),
+            MemberLookupPolicy::REQUIRE_CONCRETE,
+        )
         .place
     {
         ExplicitAttributeWriteRequirement::Descriptor {
@@ -454,7 +400,7 @@ fn explicit_attribute_write_requirement<'db>(
         }
     } else {
         ExplicitAttributeWriteRequirement::AssignableTo {
-            ty: effective_write_type(db, object_ty, attribute, attr_ty),
+            ty: effective_write_type(db, program, object_ty, attribute, attr_ty),
             qualifiers,
         }
     }
@@ -466,6 +412,7 @@ fn explicit_attribute_write_requirement<'db>(
 /// assignment diagnostic layer.
 fn instance_fallback_write_requirement<'db>(
     db: &'db dyn Db,
+    program: Program,
     object_ty: Type<'db>,
     attribute: &str,
     fallback: PlaceAndQualifiers<'db>,
@@ -479,9 +426,9 @@ fn instance_fallback_write_requirement<'db>(
     else {
         return FallbackAttributeWriteRequirement::PossiblyMissing;
     };
-    let ty = ty.bind_self_typevars(db, object_ty);
+    let ty = ty.bind_self_typevars(db, program, object_ty);
     FallbackAttributeWriteRequirement::AssignableTo {
-        ty: effective_write_type(db, object_ty, attribute, ty),
+        ty: effective_write_type(db, program, object_ty, attribute, ty),
         qualifiers,
         possibly_missing: definedness == Definedness::PossiblyUndefined,
     }
@@ -490,6 +437,7 @@ fn instance_fallback_write_requirement<'db>(
 /// Convert a class-attribute fallback into a write type, binding `Self` to the class instance.
 fn class_fallback_write_requirement<'db>(
     db: &'db dyn Db,
+    program: Program,
     object_ty: Type<'db>,
     class_attr_self_ty: Type<'db>,
     fallback: PlaceAndQualifiers<'db>,
@@ -503,7 +451,7 @@ fn class_fallback_write_requirement<'db>(
     else {
         return FallbackAttributeWriteRequirement::PossiblyMissing;
     };
-    let ty = ty.bind_self_typevars(db, class_attr_self_ty);
+    let ty = ty.bind_self_typevars(db, program, class_attr_self_ty);
     let ty = if matches!(object_ty, Type::ClassLiteral(_))
         && let Type::FunctionLiteral(function) = ty
         && function.callable_type_kind(db) == CallableTypeKind::FunctionLike
@@ -526,13 +474,14 @@ fn class_fallback_write_requirement<'db>(
 /// `(str) -> int` converter is read as `int` but accepts `str` assignments.
 fn effective_write_type<'db>(
     db: &'db dyn Db,
+    program: Program,
     object_ty: Type<'db>,
     attribute: &str,
     attr_ty: Type<'db>,
 ) -> Type<'db> {
     if let Type::NominalInstance(instance) = object_ty
         && let Some(converter_ty) = instance
-            .class(db)
+            .class(db, program)
             .converter_input_type_for_field(db, attribute)
     {
         converter_ty
@@ -559,82 +508,49 @@ fn effective_write_type<'db>(
 /// ```
 pub(super) fn property_setter_returns_never<'db>(
     db: &'db dyn Db,
+    program: Program,
     property_ty: Type<'db>,
     object_ty: Type<'db>,
     value_ty: Type<'db>,
 ) -> bool {
     property_ty.as_property_instance().is_some_and(|property| {
         property.setter(db).is_some_and(|setter| {
-            match setter.try_call(db, &CallArguments::positional([object_ty, value_ty])) {
-                Ok(result) => result.return_type(db).is_never(),
-                Err(error) => error.return_type(db).is_never(),
+            match setter.try_call(
+                db,
+                program,
+                &CallArguments::positional([object_ty, value_ty]),
+            ) {
+                Ok(result) => result.return_type(db, program).is_never(),
+                Err(error) => error.return_type(db, program).is_never(),
             }
         })
     })
 }
 
-/// Return the class member that takes precedence over a definitely non-data metaclass member.
-fn class_member_preceding_non_data_metaclass_member<'db>(
-    db: &'db dyn Db,
-    object_ty: Type<'db>,
-    attribute: &str,
-    type_member: PlaceAndQualifiers<'db>,
-) -> Option<PlaceAndQualifiers<'db>> {
-    if !matches!(
-        object_ty,
-        Type::ClassLiteral(..) | Type::GenericAlias(..) | Type::SubclassOf(..)
-    ) || !type_member
-        .place
-        .ignore_possibly_undefined()?
-        .is_definitely_non_data_descriptor(db)
-    {
-        return None;
-    }
-
-    object_ty
-        .find_name_in_mro_with_policy(db, attribute, MemberLookupPolicy::default())
-        .filter(|class_attr| !class_attr.place.is_undefined())
-}
-
-/// Return the members considered by attribute assignment in lookup-precedence order.
+/// Return the primary and optional fallback members considered by attribute assignment.
 ///
-/// The type member comes from class-member lookup. A member found directly on the receiver is
-/// queried when the type member is absent or possibly undefined. For class objects, a class-MRO
-/// member instead takes precedence over a definitely non-data metaclass member. Composite and
-/// dynamic receiver types return `None`; their callers either decompose them before this point or
-/// handle them without member lookup.
+/// The primary member comes from class-member lookup. The fallback is queried only when that
+/// member is absent or possibly undefined, and is an instance member for ordinary receivers or a
+/// class-object member for class receivers. Composite and dynamic receiver types return `None`;
+/// their callers either decompose them before this point or handle them without member lookup.
 ///
 /// This helper deliberately does not bind `Self` or interpret descriptors so that assignment,
 /// protocol compatibility, and `Final` validation share exactly the same lookup precedence.
 pub(super) fn assignment_attribute_members<'db>(
     db: &'db dyn Db,
+    program: Program,
     object_ty: Type<'db>,
     attribute: &str,
-) -> Option<AssignmentAttributeMembers<'db>> {
-    // Precise `functools.partial` instances synthesize a refined `__call__` member instead of
-    // using the broad signature from typeshed.
-    let type_member = if attribute == "__call__"
-        && matches!(
-            object_ty,
-            Type::KnownInstance(KnownInstanceType::FunctoolsPartial(_))
-        ) {
-        object_ty.member(db, attribute)
-    } else {
-        object_ty.class_member(db, attribute.into())
-    };
-    if let Some(receiver_member) =
-        class_member_preceding_non_data_metaclass_member(db, object_ty, attribute, type_member)
-    {
-        return Some(AssignmentAttributeMembers::ReceiverMember(receiver_member));
-    }
-    let needs_receiver_fallback = matches!(
-        type_member.place,
+) -> Option<(PlaceAndQualifiers<'db>, Option<PlaceAndQualifiers<'db>>)> {
+    let meta_attr = object_ty.class_member(db, program, attribute.into());
+    let needs_fallback = matches!(
+        meta_attr.place,
         Place::Defined(DefinedPlace {
             definedness: Definedness::PossiblyUndefined,
             ..
         }) | Place::Undefined
     );
-    let receiver_fallback = if needs_receiver_fallback {
+    let fallback_attr = if needs_fallback {
         Some(match object_ty {
             Type::NominalInstance(..)
             | Type::ProtocolInstance(_)
@@ -657,9 +573,9 @@ pub(super) fn assignment_attribute_members<'db>(
             | Type::TypeGuard(_)
             | Type::TypeForm(_)
             | Type::TypedDict(_)
-            | Type::NewTypeInstance(_) => object_ty.instance_member(db, attribute),
+            | Type::NewTypeInstance(_) => object_ty.instance_member(db, program, attribute),
             Type::ClassLiteral(..) | Type::GenericAlias(..) | Type::SubclassOf(..) => {
-                object_ty.class_object_member(db, attribute, MemberLookupPolicy::default())
+                object_ty.class_object_member(db, program, attribute, MemberLookupPolicy::default())
             }
             Type::Union(..)
             | Type::Intersection(..)
@@ -673,8 +589,5 @@ pub(super) fn assignment_attribute_members<'db>(
     } else {
         None
     };
-    Some(AssignmentAttributeMembers::TypeMember {
-        member: type_member,
-        receiver_fallback,
-    })
+    Some((meta_attr, fallback_attr))
 }

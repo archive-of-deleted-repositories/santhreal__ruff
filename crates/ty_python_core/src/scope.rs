@@ -4,16 +4,17 @@ use ruff_db::{files::File, parsed::ParsedModuleRef};
 use ruff_index::newtype_index;
 use ruff_python_ast::{self as ast, NodeIndex};
 
+use crate::program::Program;
 use crate::{
-    Db, SemanticIndex, ast_node_ref::AstNodeRef, definition::Definition, node_key::NodeKey,
-    semantic_index,
+    Db, SemanticIndex, ast_node_ref::AstNodeRef, definition::Definition, environment::AnalysisFile,
+    node_key::NodeKey, semantic_index,
 };
 
 /// A cross-module identifier of a scope that can be used as a salsa query parameter.
 #[salsa::tracked(debug, heap_size=ruff_memory_usage::heap_size)]
 pub struct ScopeId<'db> {
     #[returns(copy)]
-    pub file: File,
+    pub analysis_file: AnalysisFile<'db>,
 
     #[returns(copy)]
     pub file_scope_id: FileScopeId,
@@ -23,11 +24,19 @@ pub struct ScopeId<'db> {
 impl get_size2::GetSize for ScopeId<'_> {}
 
 impl<'db> ScopeId<'db> {
+    pub fn program(self, db: &'db dyn Db) -> Program {
+        self.analysis_file(db).program(db)
+    }
+
+    pub fn file(self, db: &'db dyn Db) -> File {
+        self.analysis_file(db).file(db)
+    }
+
     pub fn is_annotation(self, db: &'db dyn Db) -> bool {
         self.node(db).scope_kind().is_annotation()
     }
 
-    pub fn node(self, db: &dyn Db) -> &NodeWithScopeKind {
+    pub fn node(self, db: &'db dyn Db) -> &'db NodeWithScopeKind {
         self.scope(db).node()
     }
 
@@ -43,13 +52,14 @@ impl<'db> ScopeId<'db> {
         )
     }
 
-    pub fn scope(self, db: &dyn Db) -> &Scope {
-        semantic_index(db, self.file(db)).scope(self.file_scope_id(db))
+    pub fn scope(self, db: &'db dyn Db) -> &'db Scope {
+        semantic_index(db, self.analysis_file(db)).scope(self.file_scope_id(db))
     }
 
     /// Returns the class definition for the enclosing class if this scope is a method body.
     pub fn class_definition_of_method(self, db: &'db dyn Db) -> Option<Definition<'db>> {
-        semantic_index(db, self.file(db)).class_definition_of_method(self.file_scope_id(db))
+        semantic_index(db, self.analysis_file(db))
+            .class_definition_of_method(self.file_scope_id(db))
     }
 
     pub fn is_method_scope(self, db: &'db dyn Db) -> bool {
@@ -84,7 +94,7 @@ impl<'db> ScopeId<'db> {
 
 /// ID that uniquely identifies a scope inside of a module.
 #[newtype_index]
-#[derive(Ord, PartialOrd, get_size2::GetSize)]
+#[derive(Ord, PartialOrd, salsa::SalsaValue, get_size2::GetSize)]
 pub struct FileScopeId;
 
 impl FileScopeId {
@@ -97,7 +107,7 @@ impl FileScopeId {
         self == FileScopeId::global()
     }
 
-    pub fn to_scope_id(self, db: &dyn Db, file: File) -> ScopeId<'_> {
+    pub fn to_scope_id<'db>(self, db: &'db dyn Db, file: AnalysisFile<'db>) -> ScopeId<'db> {
         let index = semantic_index(db, file);
         index.scope_ids_by_scope[self]
     }
@@ -111,7 +121,7 @@ impl FileScopeId {
     }
 }
 
-#[derive(Debug, get_size2::GetSize)]
+#[derive(Debug, salsa::SalsaValue, get_size2::GetSize)]
 pub struct Scope {
     /// The parent scope, if any.
     parent: Option<FileScopeId>,
@@ -367,7 +377,7 @@ impl NodeWithScopeRef<'_> {
 }
 
 /// Node that introduces a new scope.
-#[derive(Clone, Debug, get_size2::GetSize)]
+#[derive(Clone, Debug, salsa::SalsaValue, get_size2::GetSize)]
 pub enum NodeWithScopeKind {
     Module,
     Class(AstNodeRef<ast::StmtClassDef>),

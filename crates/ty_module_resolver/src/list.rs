@@ -7,11 +7,12 @@ use crate::db::Db;
 use crate::module::{Module, ModuleKind};
 use crate::module_name::ModuleName;
 use crate::path::{ModulePath, SearchPath, SystemOrVendoredPathRef};
+use crate::program::ResolverProgram;
 use crate::resolve::{ModuleResolveMode, ResolverContext, resolve_file_module, search_paths};
 
 /// List all available modules, including all sub-modules, sorted in lexicographic order.
-pub fn all_modules(db: &dyn Db) -> Vec<Module<'_>> {
-    let mut modules = list_modules(db).to_vec();
+pub fn all_modules(db: &dyn Db, program: ResolverProgram) -> Vec<Module<'_>> {
+    let mut modules = list_modules(db, program).to_vec();
     let mut stack = modules.clone();
     while let Some(module) = stack.pop() {
         for &submodule in module.all_submodules(db) {
@@ -24,11 +25,15 @@ pub fn all_modules(db: &dyn Db) -> Vec<Module<'_>> {
 }
 
 /// List all available top-level modules.
+/// List all available top-level modules in one resolver program.
 #[salsa::tracked(returns(deref))]
-pub fn list_modules(db: &dyn Db) -> Box<[Module<'_>]> {
+pub fn list_modules(db: &dyn Db, program: ResolverProgram) -> Box<[Module<'_>]> {
     let mut modules: BTreeMap<&ModuleName, ListedModule<'_>> = BTreeMap::new();
-    for search_path in search_paths(db, ModuleResolveMode::Typing) {
-        for &new in list_modules_in(db, SearchPathIngredient::new(db, search_path.clone())) {
+    for search_path in search_paths(db, program, ModuleResolveMode::StubsAllowed) {
+        for &new in list_modules_in(
+            db,
+            SearchPathIngredient::new(db, program, search_path.clone()),
+        ) {
             match modules.entry(new.module(db).name(db)) {
                 Entry::Vacant(entry) => {
                     entry.insert(new);
@@ -48,7 +53,7 @@ pub fn list_modules(db: &dyn Db) -> Box<[Module<'_>]> {
                     let existing_is_namespace = existing.module(db).search_path(db).is_none();
                     let new_is_non_namespace = new.module(db).search_path(db).is_some();
                     if (existing_is_namespace && new_is_non_namespace)
-                        || (!existing.is_stub_package(db) && new.is_stub_package(db))
+                        || (!existing.is_stub_package(db) && *new.is_stub_package(db))
                     {
                         entry.insert(new);
                     }
@@ -58,12 +63,13 @@ pub fn list_modules(db: &dyn Db) -> Box<[Module<'_>]> {
     }
     modules
         .into_values()
-        .map(|listed| listed.module(db))
+        .map(|listed| *listed.module(db))
         .collect()
 }
 
 #[salsa::tracked(debug, heap_size=ruff_memory_usage::heap_size)]
 struct SearchPathIngredient<'db> {
+    program: ResolverProgram,
     #[returns(ref)]
     path: SearchPath,
 }
@@ -75,7 +81,7 @@ fn list_modules_in<'db>(
     search_path: SearchPathIngredient<'db>,
 ) -> Vec<ListedModule<'db>> {
     tracing::debug!("Listing modules in search path '{}'", search_path.path(db));
-    let mut lister = Lister::new(db, search_path.path(db));
+    let mut lister = Lister::new(db, *search_path.program(db), search_path.path(db));
     match search_path.path(db).as_path() {
         SystemOrVendoredPathRef::System(system_search_path) => {
             let Ok(listing) = directory_listing(db, system_search_path) else {
@@ -98,9 +104,7 @@ fn list_modules_in<'db>(
 /// A module paired with whether it came from a stub package.
 #[salsa::interned(debug, heap_size=ruff_memory_usage::heap_size)]
 struct ListedModule<'db> {
-    #[returns(copy)]
     module: Module<'db>,
-    #[returns(copy)]
     is_stub_package: bool,
 }
 
@@ -115,6 +119,7 @@ impl get_size2::GetSize for ListedModule<'_> {}
 /// in the same directory).
 struct Lister<'db> {
     db: &'db dyn Db,
+    program: ResolverProgram,
     search_path: &'db SearchPath,
     modules: BTreeMap<&'db ModuleName, ListedModule<'db>>,
 }
@@ -122,9 +127,10 @@ struct Lister<'db> {
 impl<'db> Lister<'db> {
     /// Create new state that can accumulate modules from a list
     /// of file paths.
-    fn new(db: &'db dyn Db, search_path: &'db SearchPath) -> Lister<'db> {
+    fn new(db: &'db dyn Db, program: ResolverProgram, search_path: &'db SearchPath) -> Lister<'db> {
         Lister {
             db,
+            program,
             search_path,
             modules: BTreeMap::new(),
         }
@@ -177,6 +183,7 @@ impl<'db> Lister<'db> {
                         &module_path,
                         Module::file_module(
                             self.db,
+                            self.program,
                             module_name,
                             ModuleKind::Package,
                             self.search_path.clone(),
@@ -221,7 +228,7 @@ impl<'db> Lister<'db> {
                 if !self.search_path.is_standard_library() {
                     self.add_module(
                         &module_path,
-                        Module::namespace_package(self.db, module_name),
+                        Module::namespace_package(self.db, self.program, module_name),
                     );
                 }
                 return;
@@ -249,6 +256,7 @@ impl<'db> Lister<'db> {
             &module_path,
             Module::file_module(
                 self.db,
+                self.program,
                 module_name,
                 ModuleKind::Module,
                 self.search_path.clone(),
@@ -320,13 +328,14 @@ impl<'db> Lister<'db> {
 
     /// Returns true if the given module name cannot be shadowable.
     fn is_non_shadowable(&self, name: &ModuleName) -> bool {
-        ModuleResolveMode::Typing.is_non_shadowable(self.python_version().minor, name.as_str())
+        ModuleResolveMode::StubsAllowed
+            .is_non_shadowable(self.python_version().minor, name.as_str())
     }
 
     /// Returns the Python version we want to perform module resolution
     /// with.
     fn python_version(&self) -> PythonVersion {
-        self.db.python_version()
+        self.program.python_version(self.db)
     }
 
     /// Constructs a resolver context for use with some APIs that require it.
@@ -334,9 +343,10 @@ impl<'db> Lister<'db> {
         ResolverContext {
             db: self.db,
             python_version: self.python_version(),
+            typeshed_versions: self.program.search_paths(self.db).typeshed_versions(),
             // We don't currently support listing modules
             // in a "no stubs allowed" mode.
-            mode: ModuleResolveMode::Typing,
+            mode: ModuleResolveMode::StubsAllowed,
         }
     }
 }
@@ -403,6 +413,7 @@ mod tests {
 
     use crate::db::{Db, tests::TestDb};
     use crate::module::Module;
+    use crate::program::ResolverProgram;
     use crate::resolve::{
         ModuleResolveMode, ModuleResolveModeIngredient, dynamic_resolution_paths,
     };
@@ -410,7 +421,15 @@ mod tests {
     use crate::strategy::FallibleStrategy;
     use crate::testing::{FileSpec, MockedTypeshed, TestCase, TestCaseBuilder};
 
-    use super::list_modules;
+    use super::list_modules as list_modules_query;
+
+    fn resolver_program(db: &TestDb) -> ResolverProgram {
+        db.resolver_program()
+    }
+
+    fn list_modules(db: &TestDb) -> Box<[Module<'_>]> {
+        list_modules_query(db, resolver_program(db)).into()
+    }
 
     struct ModuleDebugSnapshot<'db> {
         db: &'db dyn Db,
@@ -460,18 +479,18 @@ mod tests {
         }
     }
 
-    fn sorted_list(db: &dyn Db) -> Vec<Module<'_>> {
+    fn sorted_list(db: &TestDb) -> Vec<Module<'_>> {
         let mut modules = list_modules(db).to_vec();
         modules.sort_by(|m1, m2| m1.name(db).cmp(m2.name(db)));
         modules
     }
 
-    fn list_snapshot(db: &dyn Db) -> Vec<ModuleDebugSnapshot<'_>> {
+    fn list_snapshot(db: &TestDb) -> Vec<ModuleDebugSnapshot<'_>> {
         list_snapshot_filter(db, |_| true)
     }
 
     fn list_snapshot_filter<'db>(
-        db: &'db dyn Db,
+        db: &'db TestDb,
         predicate: impl Fn(&Module<'db>) -> bool,
     ) -> Vec<ModuleDebugSnapshot<'db>> {
         sorted_list(db)
@@ -1439,7 +1458,11 @@ not_a_directory
         assert_function_query_was_not_run(
             &db,
             dynamic_resolution_paths,
-            ModuleResolveModeIngredient::new(&db, ModuleResolveMode::Typing),
+            ModuleResolveModeIngredient::new(
+                &db,
+                resolver_program(&db),
+                ModuleResolveMode::StubsAllowed,
+            ),
             &events,
         );
     }
