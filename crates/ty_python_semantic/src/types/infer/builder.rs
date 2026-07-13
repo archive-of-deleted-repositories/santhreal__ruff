@@ -47,15 +47,16 @@ use crate::types::callable::{CallableFunctionProvenance, CallableTypeKind};
 use crate::types::class::{ClassLiteral, CodeGeneratorKind, MethodDecorator};
 use crate::types::constraints::{ConstraintSetBuilder, PathBounds, Solutions};
 use crate::types::context::InferContext;
+use crate::types::dedicated::pydantic;
 use crate::types::diagnostic::{
     self, CALL_NON_CALLABLE, CONFLICTING_DECLARATIONS, CYCLIC_TYPE_ALIAS_DEFINITION,
     GeneratorMismatchKind, INEFFECTIVE_FINAL, INVALID_ARGUMENT_TYPE, INVALID_ASSIGNMENT,
     INVALID_DECLARATION, INVALID_ENUM_MEMBER_ANNOTATION, INVALID_LEGACY_TYPE_VARIABLE,
     INVALID_NEWTYPE, INVALID_PARAMSPEC, INVALID_TYPE_ALIAS_TYPE, INVALID_TYPE_FORM,
     INVALID_TYPE_GUARD_CALL, INVALID_TYPE_VARIABLE_BOUND, INVALID_TYPE_VARIABLE_CONSTRAINTS,
-    POSSIBLY_MISSING_IMPLICIT_CALL, POSSIBLY_MISSING_SUBMODULE, UNDEFINED_REVEAL,
-    UNRESOLVED_ATTRIBUTE, UNRESOLVED_GLOBAL, UNRESOLVED_REFERENCE, UNSUPPORTED_OPERATOR,
-    UNUSED_AWAITABLE, hint_if_stdlib_attribute_exists_on_other_versions,
+    POSSIBLY_MISSING_IMPLICIT_CALL, POSSIBLY_MISSING_SUBMODULE, PYDANTIC_DISCARDED_EXTRA_ARGUMENT,
+    UNDEFINED_REVEAL, UNRESOLVED_ATTRIBUTE, UNRESOLVED_GLOBAL, UNRESOLVED_REFERENCE,
+    UNSUPPORTED_OPERATOR, UNUSED_AWAITABLE, hint_if_stdlib_attribute_exists_on_other_versions,
     report_attempted_protocol_instantiation, report_bad_dunder_delattr_call,
     report_bad_dunder_delete_call, report_call_to_abstract_method,
     report_cannot_pop_required_field_on_typed_dict, report_invalid_assignment,
@@ -7732,6 +7733,61 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         }))
     }
 
+    fn report_pydantic_discarded_extra_arguments(
+        &self,
+        class: ClassType<'db>,
+        arguments: &ast::Arguments,
+        bindings: &Bindings<'db>,
+    ) {
+        let Some((class, _)) = class.static_class_literal(self.db()) else {
+            return;
+        };
+        let Some(metadata) = CodeGeneratorKind::from_class(self.db(), class.into())
+            .and_then(CodeGeneratorKind::pydantic_metadata)
+        else {
+            return;
+        };
+        if !pydantic::model_init_discards_extra(self.db(), class, metadata) {
+            return;
+        }
+
+        let Some(builder) = self
+            .context
+            .report_lint(&PYDANTIC_DISCARDED_EXTRA_ARGUMENT, arguments)
+        else {
+            return;
+        };
+
+        let extra_names: Vec<_> = arguments
+            .iter_source_order()
+            .enumerate()
+            .filter_map(|(argument_index, argument)| {
+                let ArgOrKeyword::Keyword(keyword) = argument else {
+                    return None;
+                };
+                let name = keyword.arg.as_ref()?;
+                bindings
+                    .constructor_init_argument_matches_keyword_variadic(argument_index)
+                    .then_some(name)
+            })
+            .collect();
+
+        match extra_names.as_slice() {
+            [] => {}
+            [name] => {
+                builder.into_diagnostic(format_args!(
+                    "Extra argument `{name}` is discarded by Pydantic"
+                ));
+            }
+            names => {
+                builder.into_diagnostic(format_args!(
+                    "Extra arguments {} are discarded by Pydantic",
+                    format_enumeration(names.iter().map(|name| format!("`{name}`")))
+                ));
+            }
+        }
+    }
+
     fn infer_call_expression_impl(
         &mut self,
         call_expression: &ast::ExprCall,
@@ -8206,6 +8262,10 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 return bindings.return_type(self.db());
             }
         };
+
+        if let Some(class) = class {
+            self.report_pydantic_discarded_extra_arguments(class, arguments, &bindings);
+        }
 
         for binding in bindings.iter_flat_mut() {
             let binding_type = binding.callable_type;

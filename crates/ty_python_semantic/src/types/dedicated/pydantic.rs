@@ -44,6 +44,10 @@ impl<'db> ModelMetadata<'db> {
         !matches!(self.config(db).extra, Some(ExtraBehavior::Forbid))
     }
 
+    fn discards_extra(self, db: &'db dyn Db) -> bool {
+        matches!(self.config(db).extra, None | Some(ExtraBehavior::Ignore))
+    }
+
     pub(in crate::types) fn validates_by_alias(self, db: &'db dyn Db) -> bool {
         self.config(db).validate_by_alias.enabled_or(true)
     }
@@ -902,16 +906,14 @@ fn lax_alias<'db>(db: &'db dyn Db, name: &str) -> Type<'db> {
     }
 }
 
-/// Return `true` if `class` should accept extra keywords in its synthesized constructor.
-pub(in crate::types) fn model_init_accepts_extra(
-    db: &dyn Db,
-    class: StaticClassLiteral<'_>,
-    metadata: ModelMetadata<'_>,
-) -> bool {
-    if !metadata.accepts_extra(db) {
-        return false;
-    }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ModelInitBehavior {
+    BaseModel,
+    CustomVariadic,
+    Other,
+}
 
+fn model_init_behavior(db: &dyn Db, class: StaticClassLiteral<'_>) -> ModelInitBehavior {
     for base in class
         .iter_mro(db, None)
         .skip(1)
@@ -920,30 +922,56 @@ pub(in crate::types) fn model_init_accepts_extra(
         .map(|(base, _)| base)
     {
         if base.is_known(db, KnownClass::PydanticBaseModel) {
-            return true;
+            return ModelInitBehavior::BaseModel;
         }
 
         // These constructors use variadic keywords for specialized inputs, not arbitrary extras.
         if base.is_known(db, KnownClass::PydanticRootModel)
             || base.is_known(db, KnownClass::PydanticBaseSettings)
         {
-            return false;
+            return ModelInitBehavior::Other;
         }
 
         let init = class_member(db, base.body_scope(db), "__init__");
         if !init.is_undefined() {
-            return init
+            return if init
                 .ignore_possibly_undefined()
                 .and_then(Type::as_function_literal)
                 .is_some_and(|init| {
                     init.signature(db)
                         .iter()
                         .any(|signature| signature.parameters().keyword_variadic().is_some())
-                });
+                }) {
+                ModelInitBehavior::CustomVariadic
+            } else {
+                ModelInitBehavior::Other
+            };
         }
     }
 
-    false
+    ModelInitBehavior::Other
+}
+
+/// Return `true` if `class` should accept extra keywords in its synthesized constructor.
+pub(in crate::types) fn model_init_accepts_extra(
+    db: &dyn Db,
+    class: StaticClassLiteral<'_>,
+    metadata: ModelMetadata<'_>,
+) -> bool {
+    metadata.accepts_extra(db)
+        && matches!(
+            model_init_behavior(db, class),
+            ModelInitBehavior::BaseModel | ModelInitBehavior::CustomVariadic
+        )
+}
+
+/// Return `true` if extra keywords passed to `class` are silently discarded by Pydantic.
+pub(in crate::types) fn model_init_discards_extra(
+    db: &dyn Db,
+    class: StaticClassLiteral<'_>,
+    metadata: ModelMetadata<'_>,
+) -> bool {
+    metadata.discards_extra(db) && model_init_behavior(db, class) == ModelInitBehavior::BaseModel
 }
 
 /// Create the catch-all keyword parameter for a Pydantic model constructor.

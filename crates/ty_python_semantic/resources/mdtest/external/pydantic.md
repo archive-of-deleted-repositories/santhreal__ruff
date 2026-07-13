@@ -747,7 +747,8 @@ from pydantic import BaseModel, ConfigDict
 class Person(BaseModel):
     name: str
 
-Person(name="Alice", something_else=7)
+Person(name="Alice", something_else=7)  # error: [pydantic-discarded-extra-argument]
+Person(name="Alice", first=1, second=2)  # error: [pydantic-discarded-extra-argument]
 ```
 
 By setting `extra="forbid"`, this can be disallowed:
@@ -767,7 +768,7 @@ class PersonIgnoringExtras(BaseModel):
 
     name: str
 
-PersonIgnoringExtras(name="Alice", something_else=7)
+PersonIgnoringExtras(name="Alice", something_else=7)  # error: [pydantic-discarded-extra-argument]
 
 class PersonAllowingExtras(BaseModel):
     model_config = ConfigDict(extra="allow")
@@ -825,7 +826,7 @@ class PersonWithExtraField(BaseModel):
 
 # revealed: (self: PersonWithExtraField, *, extra: LaxInt, **extra_: Any) -> None
 reveal_type(PersonWithExtraField.__init__)
-PersonWithExtraField(extra=1, something_else=2)
+PersonWithExtraField(extra=1, something_else=2)  # error: [pydantic-discarded-extra-argument]
 ```
 
 ## Private attributes
@@ -1087,7 +1088,7 @@ class OverridesForbidExtras(ForbidExtras):
 
     name: str
 
-OverridesForbidExtras(name="Alice", something_else=7)
+OverridesForbidExtras(name="Alice", something_else=7)  # error: [pydantic-discarded-extra-argument]
 
 class KeepsInheritedExtraSetting(ForbidExtras):
     model_config = ConfigDict(strict=True)
@@ -1280,7 +1281,7 @@ reveal_type(User.__init__)  # revealed: (self: User, *, name: LaxStr, age: LaxIn
 
 User(name="alice")
 User(name="alice", age=1)
-User(name="alice", extra=1)
+User(name="alice", extra=1)  # error: [pydantic-discarded-extra-argument]
 
 # error: [missing-argument]
 User()
