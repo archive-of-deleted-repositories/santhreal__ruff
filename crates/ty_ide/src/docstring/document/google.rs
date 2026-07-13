@@ -34,6 +34,8 @@ use indexmap::IndexMap;
 use ruff_python_stdlib::identifiers::is_identifier;
 use ruff_text_size::{TextRange, TextSize};
 
+use crate::docstring::normalize_parameter_documentation;
+
 use super::SectionKind;
 use super::preformatted::PreformattedBlockScanner;
 use super::syntax::{
@@ -147,7 +149,11 @@ fn extend_parameter_documentation(parameters: &mut Parameters, lines: &[ParsedLi
         if !description.is_empty() && !description.ends_with('\n') {
             description.push('\n');
         }
-        description.push_str(if trimmed.is_empty() { "\n" } else { trimmed });
+        description.push_str(if trimmed.is_empty() {
+            "\n"
+        } else {
+            line.text.trim_end()
+        });
     }
 
     // A following item completes its predecessor in the loop, so complete the final item here.
@@ -195,12 +201,12 @@ impl Parameters {
         let Some((names, description)) = parameter else {
             return;
         };
-        let description = description.trim();
+        let description = normalize_parameter_documentation(&description);
         if !description.is_empty()
             && let Some(names) = google_parameter_names(&names)
         {
             for name in names {
-                self.0.insert(name.to_string(), description.to_string());
+                self.0.insert(name.to_string(), description.clone());
             }
         }
     }
@@ -796,7 +802,7 @@ Args:
     }
 
     #[test]
-    fn keeps_rest_literal_blocks_in_parameter_documentation() {
+    fn preserves_rest_literal_block_indentation_in_parameter_documentation() {
         assert_parameter_documentation(
             "\
 Args:
@@ -808,8 +814,24 @@ Args:
             &[
                 (
                     "value",
-                    "Documentation.\nExample::\nArgs:\nnested: Not parameter documentation.",
+                    "Documentation.\nExample::\n    Args:\n        nested: Not parameter documentation.",
                 ),
+                ("other", "Other documentation."),
+            ],
+        );
+    }
+
+    #[test]
+    fn preserves_indentation_in_continuation_only_parameter_documentation() {
+        assert_parameter_documentation(
+            "\
+Args:
+    value:
+        Example::
+            nested
+    other: Other documentation.",
+            &[
+                ("value", "Example::\n    nested"),
                 ("other", "Other documentation."),
             ],
         );

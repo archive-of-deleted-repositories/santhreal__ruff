@@ -156,6 +156,20 @@ fn documentation_trim(docs: &str) -> String {
     output
 }
 
+/// Removes structural indentation from extracted parameter documentation while preserving
+/// meaningful relative indentation.
+fn normalize_parameter_documentation(documentation: &str) -> String {
+    // An inline description is already flush left, but a continuation-only description's first
+    // line still has structural indentation. Prefix the latter with a blank line so PEP 257
+    // normalization includes its first content line when calculating the common margin.
+    let normalized = if leading_indentation(documentation).is_empty() {
+        documentation_trim(documentation)
+    } else {
+        documentation_trim(&format!("\n{documentation}"))
+    };
+    normalized.trim_end().to_string()
+}
+
 /// Calculate the indentation level of a line.
 ///
 /// Based on python's expandtabs (where tabs are considered 8 spaces).
@@ -206,8 +220,11 @@ fn extract_numpy_style_params(docstring: &str) -> IndexMap<String, String> {
             let current_indent = get_indentation_level(line);
             let trimmed = line.trim();
 
-            // Skip empty lines
+            // Preserve paragraph breaks within the current parameter documentation.
             if trimmed.is_empty() {
+                if !current_doc.is_empty() {
+                    current_doc.push('\n');
+                }
                 continue;
             }
 
@@ -217,7 +234,10 @@ fn extract_numpy_style_params(docstring: &str) -> IndexMap<String, String> {
                     if NUMPY_UNDERLINE_REGEX.is_match(next_line) {
                         // This is another section
                         if let Some(param_name) = current_param.take() {
-                            param_docs.insert(param_name, current_doc.trim().to_string());
+                            param_docs.insert(
+                                param_name,
+                                normalize_parameter_documentation(&current_doc),
+                            );
                             current_doc.clear();
                         }
                         in_params_section = false;
@@ -243,7 +263,10 @@ fn extract_numpy_style_params(docstring: &str) -> IndexMap<String, String> {
                     if NUMPY_UNDERLINE_REGEX.is_match(next_line) {
                         // This is a section header, not a parameter
                         if let Some(param_name) = current_param.take() {
-                            param_docs.insert(param_name, current_doc.trim().to_string());
+                            param_docs.insert(
+                                param_name,
+                                normalize_parameter_documentation(&current_doc),
+                            );
                             current_doc.clear();
                         }
                         in_params_section = false;
@@ -260,7 +283,8 @@ fn extract_numpy_style_params(docstring: &str) -> IndexMap<String, String> {
                 if trimmed.contains(':') {
                     // Save previous parameter if exists
                     if let Some(param_name) = current_param.take() {
-                        param_docs.insert(param_name, current_doc.trim().to_string());
+                        param_docs
+                            .insert(param_name, normalize_parameter_documentation(&current_doc));
                         current_doc.clear();
                     }
 
@@ -278,7 +302,8 @@ fn extract_numpy_style_params(docstring: &str) -> IndexMap<String, String> {
                     // Handle parameter without type annotation
                     // Save previous parameter if exists
                     if let Some(param_name) = current_param.take() {
-                        param_docs.insert(param_name, current_doc.trim().to_string());
+                        param_docs
+                            .insert(param_name, normalize_parameter_documentation(&current_doc));
                         current_doc.clear();
                     }
 
@@ -311,12 +336,13 @@ fn extract_numpy_style_params(docstring: &str) -> IndexMap<String, String> {
                     if !current_doc.is_empty() {
                         current_doc.push('\n');
                     }
-                    current_doc.push_str(trimmed);
+                    current_doc.push_str(line.trim_end());
                 } else {
                     // This line doesn't match our expected indentation patterns
                     // Save current parameter and stop processing
                     if let Some(param_name) = current_param.take() {
-                        param_docs.insert(param_name, current_doc.trim().to_string());
+                        param_docs
+                            .insert(param_name, normalize_parameter_documentation(&current_doc));
                         current_doc.clear();
                     }
                     in_params_section = false;
@@ -327,7 +353,7 @@ fn extract_numpy_style_params(docstring: &str) -> IndexMap<String, String> {
 
     // Don't forget the last parameter
     if let Some(param_name) = current_param {
-        param_docs.insert(param_name, current_doc.trim().to_string());
+        param_docs.insert(param_name, normalize_parameter_documentation(&current_doc));
     }
 
     param_docs
@@ -1373,6 +1399,29 @@ Summary.
         str<HB>
         &nbsp;&nbsp;&nbsp;&nbsp;The return value description
         ");
+    }
+
+    #[test]
+    fn numpy_parameter_documentation_preserves_relative_indentation() {
+        let docstring = Docstring::new(
+            r#"
+        Parameters
+        ----------
+        value : str
+            Example::
+
+                nested
+        "#
+            .to_owned(),
+        );
+
+        assert_eq!(
+            docstring
+                .parameter_documentation()
+                .get("value")
+                .map(String::as_str),
+            Some("Example::\n\n    nested")
+        );
     }
 
     #[test]
